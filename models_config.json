@@ -1,0 +1,8 @@
+{
+  "signal_model": { "enabled": false },
+  "paviment_model": {
+    "yolo_threshold": 0.20,
+    "yolo_iou": 0.45,
+    "yolo_max_detections": 300
+  }
+}
