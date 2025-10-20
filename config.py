@@ -1,7 +1,20 @@
+"""
+config.py
+---------
+Descripción general:
+Este módulo centraliza la **configuración** de la aplicación: rutas por defecto,
+carpetas de artefactos/modelos, ruta al archivo de configuración del modelo,
+diccionario de códigos → descripciones legibles y los tipos de archivo permitidos
+para la fuente de GPS. No contiene lógica de negocio ni interfaz.
+
+Cómo se usa:
+- Otros módulos (p. ej., `pipeline_logic.py`, `checks.py`, `mapping.py`, `ui.py`)
+  importan estas constantes para mantener un único punto de verdad.
+- Puedes ajustar nombres/rutas sin tocar el resto del código.
+"""
 from pathlib import Path
 
 # ---- CONFIG ----
-INPUT_VIDEO = "Carretera_2.mp4"            # Cambia si tu video tiene otro nombre
 ARTIFACTS_DIR = Path("./artifacts")
 CONFIG_JSON = "./models_config.json"
 # -----------------

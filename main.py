@@ -1,159 +1,165 @@
-from pathlib import Path
-from tkinter import Tk, ttk, filedialog, messagebox
-import threading
-import os
-#os.environ["TQDM_DISABLE"] = "1"
+"""
+main.py
+------------------
+Descripción general:
+Este módulo implementa la LÓGICA PRINCIPAL del programa:
+- Validaciones iniciales del entorno y del video.
+- Selección opcional de fuente GPS (o stub si no hay archivo).
+- Carga del modelo ML y parches auxiliares.
+- Ejecución del workflow con una UI de progreso (ProgressUI del módulo ui del proyecto).
+- Manejo del cierre de ventanas.
+- Traducción de CSVs resultantes al finalizar.
 
+Este archivo NO contiene la interfaz del menú (eso está en main_ui.py).
+Se comunica con ProgressUI y otros módulos utilitarios.
+
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+from tkinter import Tk, filedialog, messagebox
+import threading
+import sys
+
+# Dependencias internas del proyecto
 from config import ARTIFACTS_DIR, CONFIG_JSON, CODE_TO_DESC_DEFAULT, GPS_FILETYPES
 from checks import check_environment, read_video_duration
 from no_gps import make_gps_stub
 from loader import load_ml_processor
-from patches import patch_gps_sources, patch_workflows_gps, wrap_safe_predict, patch_overlay_utils, install_tqdm_bridge
+from patches import (
+    patch_gps_sources, patch_workflows_gps, wrap_safe_predict,
+    patch_overlay_utils, install_tqdm_bridge
+)
 from mapping import build_code_to_desc
 from run_workflow import run_workflow
 from translate_csvs import translate_and_save
-from ui import run_with_progress
 from ui import ProgressUI
+from main_ui import MainUI
 
-class LauncherUI(Tk):
-    def __init__(self):
-        super().__init__()
-        self.title("Inventario de Activos Viales")
-        self.geometry("520x240")
-        self.resizable(False, False)
+"""
+   Ejecuta el pipeline completo con una UI de progreso (ventana de barras y acciones finales).
 
-        self.video_path: Path | None = None
-        self.output_dir: Path | None = None
+   Entradas:
+     - input_video: Path al video .mp4 a procesar.
+     - output_dir:  Path a la carpeta donde se guardan los resultados.
+     - on_back:     Callable sin argumentos; se invoca para "volver al menú" (re-mostrar la ventana del launcher).
 
-        title = ttk.Label(self, text="Inventario de Activos Viales", font=("Segoe UI", 14, "bold"))
-        title.pack(pady=(18, 6))
+   Salidas:
+     - No retorna valor útil. Maneja excepciones mostrando/propagando errores según el flujo.
+       Al finalizar exitoso: traduce los CSVs con translate_and_save.
 
-        # fila de info
-        self.lbl_video = ttk.Label(self, text="Video: (no seleccionado)")
-        self.lbl_video.pack(fill="x", padx=16, pady=(6, 0))
-        self.lbl_out = ttk.Label(self, text="Carpeta de salida: (no seleccionada)")
-        self.lbl_out.pack(fill="x", padx=16, pady=(2, 10))
+   Resumen interno por bloques:
+     1) Validación de entorno + lectura de metadatos del video.
+     2) Selección opcional de entrada GPS o creación de stub.
+     3) Carga de modelo ML, parches y mapeos de códigos a descripciones.
+     4) Preparación de carpeta de salida.
+     5) Lanzamiento de ProgressUI y del hilo trabajador (worker) que corre run_workflow.
+     6) Manejo del cierre por “X”: confirmar si se cancela en medio del proceso o volver al menú si ya terminó.
+     7) Al terminar, traducir CSVs (si aplica).
+   """
+def run_with_ui(input_video: Path, output_dir: Path, on_back):
 
-        # botones
-        frm = ttk.Frame(self)
-        frm.pack(pady=8)
-
-        self.btn_video = ttk.Button(frm, text="Seleccionar video (.mp4)", command=self.select_video)
-        self.btn_video.grid(row=0, column=0, padx=6, pady=6)
-
-        self.btn_out = ttk.Button(frm, text="Seleccionar carpeta de salida", command=self.select_output_dir)
-        self.btn_out.grid(row=0, column=1, padx=6, pady=6)
-
-        self.btn_start = ttk.Button(self, text="Empezar", command=self.start_process, state="disabled")
-        self.btn_start.pack(pady=(6, 8))
-
-        # pie
-        ttk.Label(self, text="Seleccione video y carpeta de salida, luego presione Empezar.").pack(pady=(0, 6))
-
-    def select_video(self):
-        p = filedialog.askopenfilename(
-            title="Seleccionar video de entrada (.mp4)",
-            filetypes=[("Archivos de video", "*.mp4")]
-        )
-        if p:
-            self.video_path = Path(p)
-            self.lbl_video.config(text=f"Video: {self.video_path.name}")
-        self._update_start_state()
-
-    def select_output_dir(self):
-        d = filedialog.askdirectory(title="Seleccionar carpeta de salida")
-        if d:
-            self.output_dir = Path(d)
-            self.lbl_out.config(text=f"Carpeta de salida: {self.output_dir}")
-        self._update_start_state()
-
-    def _update_start_state(self):
-        ok = (self.video_path is not None) and (self.output_dir is not None)
-        self.btn_start.config(state=("normal" if ok else "disabled"))
-
-    def start_process(self):
-        if not self.video_path or not self.output_dir:
-            return
-        self.withdraw()  # ocultamos el menú
-        # NO lo re-mostramos aquí; lo hará el botón "Volver al menú"
-        run_pipeline_with_ui(self.video_path, self.output_dir,
-                             on_back=lambda: self.deiconify())
-
-def run_pipeline_with_ui(input_video: Path, output_dir: Path, on_back):
-    # Validaciones y preparación
+    # ---------- [Validaciones y metadatos de video] ----------
+    # - video_duration, fps, nframes: metadatos básicos del video de entrada.
     check_environment(str(input_video), ARTIFACTS_DIR, CONFIG_JSON)
     video_duration, fps, nframes = read_video_duration(str(input_video))
+
+    # ---------- [Selección GPS (opc.)] ----------
+    # - gps_source_type: str | None, tipo lógico de fuente (ej. 'loc'); usado por loaders.
+    # - gps_input: str | None, ruta al archivo GPS seleccionado o None si se corre sin GPS.
     gps_source_type, gps_input = maybe_select_gps()
 
-    # Cargar modelo y parches
+    # ---------- [Modelo ML y parches] ----------
+    # Cargar el procesador ML y aplicar parches de seguridad/superposición.
     ml_processor = load_ml_processor(str(ARTIFACTS_DIR), CONFIG_JSON)
     wrap_safe_predict(ml_processor)
+
+    # Mapeo de códigos a descripciones (para overlays y traducciones)
     code_to_desc, _ = build_code_to_desc(CODE_TO_DESC_DEFAULT, ARTIFACTS_DIR)
     patch_overlay_utils(code_to_desc)
 
-    # Si no hay GPS real, parchea NoGPS
+    # Si no hay GPS real, parchear un stub consistente con la duración del video
     if gps_input is None:
         gps_stub = make_gps_stub(video_duration)
         patch_gps_sources(gps_stub)
         patch_workflows_gps(gps_stub)
 
-    # Salida de video dentro de output_dir
+    # ---------- [Preparar carpeta de salida] ----------
     output_dir.mkdir(parents=True, exist_ok=True)
     video_out = str(Path(output_dir) / "salida_detectada.mp4")
 
-    # Lanzar ProgressUI + worker
+    # ---------- [Lanzar UI de progreso + hilo worker] ----------
     ui = ProgressUI(title="Procesando video…")
 
-    def ui_send(name, n, total, rate, eta):
-        ui.enqueue(ui.update_task, name, n, total, rate, eta)
+    # Estructuras para comunicar resultado/errores entre hilos
+    res: dict[str, object] = {"val": None, "err": None}
+    done = threading.Event()  # se marca al finalizar el worker
 
-    import threading, sys
-    res = {"val": None, "err": None}
-    done = threading.Event()
-
+    """
+        Hilo trabajador que ejecuta run_workflow.
+        Entradas:  usa cierres sobre input_video/output_dir/etc.
+        Salidas:   setea res["val"] o res["err"], y encola acciones finales en la UI.
+    """
     def worker():
         try:
-            install_tqdm_bridge(lambda d, n, t, r, e: ui.enqueue(ui.update_task, d or "progress", n, t, r, e), max_hz=8)
+            # Puente entre tqdm y ProgressUI para reportar progreso a ~8 Hz
+            install_tqdm_bridge(
+                lambda d, n, t, r, e: ui.enqueue(ui.update_task, d or "progress", n, t, r, e),
+                max_hz=8
+            )
+
+            # Ejecuta el workflow principal con tus parámetros
             res["val"] = run_workflow(
                 str(input_video),
                 ml_processor,
                 gps_source_type=gps_source_type or "loc",
                 gps_input=gps_input,
                 batch_size=8,
-                video_output_file=str(Path(output_dir) / "salida_detectada.mp4"),
+                video_output_file=video_out,
                 min_fotogram_distance=1
             )
+
         except Exception as e:
             res["err"] = e
         finally:
+
+            # [Señal: el worker terminó]
             done.set()
+            # [Log y botones finales en la UI]
             ui.enqueue(ui.write_log, "✔ Proceso finalizado.")
-            # ¡Botones! (los dibuja el hilo de UI)
             ui.enqueue(ui.show_actions, str(output_dir), on_back)
 
+    # Lanzar worker en modo daemon (permite salir del proceso al cerrar)
     th = threading.Thread(target=worker, daemon=True)
     th.start()
 
-    # 👇 Handler al cerrar con la “X”
-    ui._closing = False  # evita cierres duplicados
+    # ---------- [Manejo de cierre] ----------
+    # Variables:
+    # - ui._closing: flag para prevenir cierres múltiples.
+    ui._closing = False
 
+    """
+        Callback de cierre de la ventana de progreso.
+        Entradas:  evento de “WM_DELETE_WINDOW”.
+        Salidas:   según el estado, o cancela (confirmando) o destruye la UI y vuelve al menú.
+    """
     def _on_close():
-        # Si ya estamos cerrando, ignora clics repetidos
+        # [Evitar interferencia por clics repetidos]
         if getattr(ui, "_closing", False):
             return
 
+        # [Si el worker NO ha terminado, confirmar cierre/aborto]
         if not done.is_set():
-            # >>> AÚN PROCESANDO: confirmar — el messagebox es modal al UI
             ans = messagebox.askyesno(
                 "Cerrar",
                 "Aún se está procesando.\n¿Desea cancelar y salir?",
                 parent=ui
             )
             if not ans:
-                # Usuario dijo NO → mantener la ventana abierta
-                return
+                return  # el usuario decide continuar procesando
 
-            # Confirmado: cerramos todo
+            # Confirmado: cerrar todo de manera segura
             ui._closing = True
             try:
                 ui.stop()
@@ -167,10 +173,11 @@ def run_pipeline_with_ui(input_video: Path, output_dir: Path, on_back):
                 ui.destroy()
             except:
                 pass
-            # hilo de trabajo es daemon=True, así que podemos terminar el proceso
+
+            # Al ser daemon=True, el hilo muere con el proceso
             sys.exit(0)
         else:
-            # >>> YA TERMINÓ: no matar la app; vuelve al menú
+            # [Si ya terminó, cerrar la ventana de progreso y volver al menú]
             ui._closing = True
             try:
                 ui.stop()
@@ -180,43 +187,56 @@ def run_pipeline_with_ui(input_video: Path, output_dir: Path, on_back):
                 ui.destroy()
             except:
                 pass
-            on_back()  # re-muestra el launcher
+            on_back()
 
+    # Vincular protocolo de cierre de la ventana
     ui.protocol("WM_DELETE_WINDOW", _on_close)
 
+    # Iniciar loop de la ventana de progreso (bloqueante)
     ui.mainloop()
 
+    # Si el worker lanzó error, propagarlo tras cerrar el loop
     if res["err"]:
-        raise res["err"]
+        raise res["err"]  # dejar que lo maneje el caller si quiere
 
-    # Traducir CSVs dentro de la carpeta de salida
+    # ---------- [Post-procesado: traducir CSVs] ----------
+    # Si todo terminó OK, traducir y guardar CSVs en la carpeta de salida
     if done.is_set():
         translate_and_save(res["val"], ARTIFACTS_DIR, code_to_desc, output_dir)
 
+    """
+    Traduce CSVs a partir de los resultados y guarda en output_dir.
+
+    Entradas:
+      - results:   objeto devuelto por run_workflow (estructura propia de tu proyecto).
+      - output_dir: Path de la carpeta destino.
+      - code_to_desc: dict de código -> descripción humana.
+
+    Salidas:
+      - None (efecto: archivos CSV traducidos escritos en disco).
+    """
 def translate_csvs_after(results, output_dir: Path, code_to_desc: dict):
+
+    # [Delegar al helper de tu proyecto]
     translate_and_save(results, ARTIFACTS_DIR, code_to_desc, output_dir)
     print("Listo. CSVs traducidos y guardados en:", output_dir)
 
-def select_input_video():
-    """Abre un cuadro de diálogo para elegir un archivo .mp4"""
-    Tk().withdraw()  # Oculta la ventana principal de Tk
-    file_path = filedialog.askopenfilename(
-        title="Seleccionar video de entrada",
-        filetypes=[("Archivos de video", "*.mp4")],
-    )
-    if not file_path:
-        raise SystemExit("No se seleccionó ningún archivo de video.")
-    return Path(file_path)
 
+"""
+    Diálogo opcional para seleccionar archivo GPS (CSV/GPX/JSON).
+    Entradas:  ninguna directa; abre cuadros de diálogo modales.
+    Salidas:   (gps_source_type, gps_input) o (None, None) si se corre sin GPS.
+
+    Notas:
+    - Por compatibilidad, se devuelve 'loc' como tipo por defecto y el loader detecta por extensión.
+    - Si el usuario cancela en cualquiera de los pasos, se asume ejecución sin GPS.
+"""
 def maybe_select_gps() -> tuple[str | None, str | None]:
-    """
-    Devuelve (gps_source_type, gps_input) o (None, None) si corremos sin GPS.
-    - gps_input: ruta al archivo CSV/GPX/JSON
-    - gps_source_type: dejamos 'loc' por compatibilidad; muchos loaders detectan
-      por extensión. Si tu workflow requiere un tipo específico, ajústalo aquí.
-    """
-    # Preguntar si desea usar GPS
+
+    # [Ocultar ventana raíz temporal para no mostrar un Tk vacío]
     Tk().withdraw()
+
+    # [Preguntar si se desea usar GPS]
     use_gps = messagebox.askyesno(
         "¿Usar GPS?",
         "¿Desea seleccionar un archivo de GPS (CSV/GPX/JSON)?\n"
@@ -225,30 +245,29 @@ def maybe_select_gps() -> tuple[str | None, str | None]:
     if not use_gps:
         return None, None
 
+    # [Seleccionar archivo GPS]
     gps_path = filedialog.askopenfilename(
         title="Seleccionar archivo de GPS",
         filetypes=GPS_FILETYPES,
     )
     if not gps_path:
-        # Si canceló aquí, seguimos sin GPS
         return None, None
 
-    # Por defecto usamos 'loc' y dejamos que el loader detecte por extensión.
+    # [Devolver tipo por defecto y la ruta elegida]
     gps_source_type = "loc"
     return gps_source_type, gps_path
 
-def _progress_callback(desc, n, total, rate_text, eta_text):
-    # Mapear nombres de tqdm a los rótulos que queremos en la UI
-    name = str(desc or "").strip() or "progress"
-    # reenviar a la UI: lo hace run_with_progress a través de un closure
-    # Aquí no tenemos la UI todavía, así que haremos el bind en la llamada:
-    pass
-
-
-
+"""
+    Punto de entrada de la aplicación.
+    Entradas:  ninguna.
+    Salidas:   ejecuta el loop principal de Tkinter.
+    """
 def main():
-    app = LauncherUI()
+
+    # [Crear y ejecutar ventana principal]
+    app = MainUI()
     app.mainloop()
+
 
 if __name__ == "__main__":
     main()
