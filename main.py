@@ -17,6 +17,7 @@ Se comunica con ProgressUI y otros módulos utilitarios.
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from tkinter import Tk, filedialog, messagebox
 import threading
@@ -109,7 +110,7 @@ def run_with_ui(input_video: Path, output_dir: Path, on_back):
             )
 
             # Ejecuta el workflow principal con tus parámetros
-            res["val"] = run_workflow(
+            results = run_workflow(
                 str(input_video),
                 ml_processor,
                 gps_source_type=gps_source_type or "loc",
@@ -118,6 +119,20 @@ def run_with_ui(input_video: Path, output_dir: Path, on_back):
                 video_output_file=video_out,
                 min_fotogram_distance=1
             )
+
+            res["val"] = results
+
+            #Intentar traducir/guardar CSVs aquí mismo
+            try:
+                output_dir.mkdir(parents=True, exist_ok=True)
+                ui.enqueue(ui.write_log, "• Traduciendo y guardando CSVs…")
+                translate_and_save(results, ARTIFACTS_DIR, code_to_desc, output_dir)
+                # Diagnóstico: listar lo que quedó
+                import os
+                saved = ", ".join(sorted([f for f in os.listdir(output_dir) if f.endswith(".csv")]))
+                ui.enqueue(ui.write_log, f"✔ CSVs ok → {saved if saved else '(no se encontraron .csv)'}")
+            except Exception as t_err:
+                ui.enqueue(ui.write_log, f"⚠ No se pudieron generar CSVs: {t_err!r}")
 
         except Exception as e:
             res["err"] = e
@@ -148,17 +163,12 @@ def run_with_ui(input_video: Path, output_dir: Path, on_back):
         if getattr(ui, "_closing", False):
             return
 
-        # [Si el worker NO ha terminado, confirmar cierre/aborto]
+        # A) NO ha terminado => confirmar y abortar todo
         if not done.is_set():
-            ans = messagebox.askyesno(
-                "Cerrar",
-                "Aún se está procesando.\n¿Desea cancelar y salir?",
-                parent=ui
-            )
+            from tkinter import messagebox
+            ans = messagebox.askyesno("Cerrar", "Aún se está procesando.\n¿Desea cancelar y salir?", parent=ui)
             if not ans:
-                return  # el usuario decide continuar procesando
-
-            # Confirmado: cerrar todo de manera segura
+                return
             ui._closing = True
             try:
                 ui.stop()
@@ -172,36 +182,27 @@ def run_with_ui(input_video: Path, output_dir: Path, on_back):
                 ui.destroy()
             except:
                 pass
+            # Salida contundente (evita zombies por múltiples Tk)
+            os._exit(0)
 
-            # Al ser daemon=True, el hilo muere con el proceso
-            sys.exit(0)
-        else:
-            # [Si ya terminó, cerrar la ventana de progreso y volver al menú]
-            ui._closing = True
-            try:
-                ui.stop()
-            except:
-                pass
-            try:
-                ui.destroy()
-            except:
-                pass
-            on_back()
+        # B) YA terminó
+        ui._closing = True
+        try:
+            ui.stop()
+        except:
+            pass
+        try:
+            ui.destroy()
+        except:
+            pass
+        os._exit(0)
+
 
     # Vincular protocolo de cierre de la ventana
     ui.protocol("WM_DELETE_WINDOW", _on_close)
 
     # Iniciar loop de la ventana de progreso (bloqueante)
     ui.mainloop()
-
-    # Si el worker lanzó error, propagarlo tras cerrar el loop
-    if res["err"]:
-        raise res["err"]  # dejar que lo maneje el caller si quiere
-
-    # ---------- [Post-procesado: traducir CSVs] ----------
-    # Si todo terminó OK, traducir y guardar CSVs en la carpeta de salida
-    if done.is_set():
-        translate_and_save(res["val"], ARTIFACTS_DIR, code_to_desc, output_dir)
 
     """
     Traduce CSVs a partir de los resultados y guarda en output_dir.
