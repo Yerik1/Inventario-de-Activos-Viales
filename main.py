@@ -35,7 +35,6 @@ from mapping import build_code_to_desc
 from run_workflow import run_workflow
 from translate_csvs import translate_and_save
 from ui import ProgressUI
-from main_ui import MainUI
 
 """
    Ejecuta el pipeline completo con una UI de progreso (ventana de barras y acciones finales).
@@ -257,17 +256,3 @@ def maybe_select_gps() -> tuple[str | None, str | None]:
     gps_source_type = "loc"
     return gps_source_type, gps_path
 
-"""
-    Punto de entrada de la aplicación.
-    Entradas:  ninguna.
-    Salidas:   ejecuta el loop principal de Tkinter.
-    """
-def main():
-
-    # [Crear y ejecutar ventana principal]
-    app = MainUI()
-    app.mainloop()
-
-
-if __name__ == "__main__":
-    main()

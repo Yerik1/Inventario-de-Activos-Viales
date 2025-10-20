@@ -11,8 +11,6 @@ Separa la lógica de procesamiento de la capa de presentación. Aquí se gestion
 
 """
 
-from __future__ import annotations
-
 from pathlib import Path
 from tkinter import Tk, ttk, filedialog
 from main import run_with_ui
