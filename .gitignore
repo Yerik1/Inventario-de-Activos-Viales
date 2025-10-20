@@ -1,4 +1,23 @@
-/.venv311/
-/Carretera_2.mp4
-/Salidas/
-/.venv/
+# Python
+.venv/
+.venv*/
+venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# IDEs
+.idea/
+*.iml
+.vscode/
+
+# Cachés comunes
+.mypy_cache/
+.pytest_cache/
+
+# Pesados (si aplica)
+*.pt
+*.onnx
+*.mp4
+*.mov
